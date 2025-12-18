@@ -32,46 +32,114 @@ class AvailabilityListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, kinesiologist_id: int):
-        kinesiologist = get_object_or_404(Kinesiologist.objects.select_related('user'), pk=kinesiologist_id)
+        kinesiologist = get_object_or_404(
+            Kinesiologist.objects.select_related("user"),
+            pk=kinesiologist_id
+        )
 
         availability_qs = (
-            Availability.objects.filter(kinesiologist=kinesiologist)
-            .order_by('day', 'start_time')
-        )
-        appointments_qs = (
-            Appointment.objects.filter(kinesiologist=kinesiologist)
-            .select_related('patient_name__user', 'kinesiologist__user')
-            .order_by('date', 'start_time')
+            Availability.objects
+            .filter(kinesiologist=kinesiologist)
+            .order_by("day", "start_time")
         )
 
-        availability = AvailabilitySerializer(availability_qs, many=True)
-        appointments = AppointmentSerializer(appointments_qs, many=True)
-        kinesiologist_data = KinesiologistSummarySerializer(kinesiologist)
+        appointments_qs = (
+            Appointment.objects
+            .filter(kinesiologist=kinesiologist)
+            .select_related("patient_name__user", "kinesiologist__user")
+            .order_by("date", "start_time")
+        )
 
         return Response(
             {
-                "kinesiologist": kinesiologist_data.data,
-                "availability": availability.data,
-                "appointments": appointments.data,
+                "kinesiologist": KinesiologistSummarySerializer(kinesiologist).data,
+                "availability": AvailabilitySerializer(availability_qs, many=True).data,
+                "appointments": AppointmentSerializer(appointments_qs, many=True).data,
             },
             status=status.HTTP_200_OK,
         )
 
     def post(self, request, kinesiologist_id: int):
-        kinesiologist = get_object_or_404(Kinesiologist.objects.select_related('user'), pk=kinesiologist_id)
+        kinesiologist = get_object_or_404(
+            Kinesiologist.objects.select_related("user"),
+            pk=kinesiologist_id
+        )
 
         if not (request.user.is_superuser or request.user == kinesiologist.user):
             return Response(
-                {
-                    "status": False,
-                    "message": "No tiene permisos para registrar este horario.",
-                },
+                {"status": False, "message": "No tiene permisos para registrar este horario."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        # ==========================
+        # BULK SAVE (frontend actual)
+        # ==========================
+        bulk = request.data.get("availability") if isinstance(request.data, dict) else None
+        if isinstance(bulk, dict):
+            day_map = {
+                "mon": 0, "tue": 1, "wed": 2,
+                "thu": 3, "fri": 4, "sat": 5, "sun": 6
+            }
+
+            created = []
+            try:
+                with transaction.atomic():
+                    # Reemplaza todo el horario existente
+                    Availability.objects.filter(kinesiologist=kinesiologist).delete()
+
+                    for day_key, blocks in bulk.items():
+                        if day_key not in day_map:
+                            raise ValidationError(f"Día inválido: {day_key}")
+
+                        if not blocks:
+                            continue
+
+                        for b in blocks:
+                            start = (b.get("start") or b.get("start_time") or "").strip()
+                            end = (b.get("end") or b.get("end_time") or "").strip()
+
+                            serializer = AvailabilitySerializer(
+                                data={
+                                    "day": day_map[day_key],
+                                    "start_time": start,
+                                    "end_time": end,
+                                },
+                                context={"kinesiologist": kinesiologist},
+                            )
+                            serializer.is_valid(raise_exception=True)
+                            created.append(serializer.save(kinesiologist=kinesiologist))
+
+            except ValidationError as exc:
+                msg = getattr(exc, "messages", [str(exc)])[0]
+                return Response(
+                    {"status": False, "message": msg},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            except IntegrityError:
+                return Response(
+                    {
+                        "status": False,
+                        "message": "No fue posible guardar el horario. Intente nuevamente.",
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+            return Response(
+                {
+                    "status": True,
+                    "message": "Disponibilidad guardada correctamente.",
+                    "availability": AvailabilitySerializer(created, many=True).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        # ======================================
+        # MODO SIMPLE (1 bloque por request)
+        # ======================================
         serializer = AvailabilitySerializer(
             data=request.data,
-            context={'kinesiologist': kinesiologist},
+            context={"kinesiologist": kinesiologist},
         )
         serializer.is_valid(raise_exception=True)
 
@@ -79,12 +147,9 @@ class AvailabilityListCreateView(APIView):
             with transaction.atomic():
                 availability = serializer.save(kinesiologist=kinesiologist)
         except ValidationError as exc:
-            message = getattr(exc, 'message', None) or getattr(exc, 'messages', [str(exc)])[0]
+            msg = getattr(exc, "messages", [str(exc)])[0]
             return Response(
-                {
-                    "status": False,
-                    "message": message,
-                },
+                {"status": False, "message": msg},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         except IntegrityError:
@@ -104,7 +169,6 @@ class AvailabilityListCreateView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
-
 
 class AppointmentCreateView(APIView):
     authentication_classes = [TokenAuthentication]
